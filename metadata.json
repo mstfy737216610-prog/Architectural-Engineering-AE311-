@@ -1,0 +1,6 @@
+{
+  "name": "NoesisAI Promo Video Studio",
+  "description": "استوديو إنتاج الفيديو الترويجي لنظام NoesisAI للتقييم النفسي الذكي — توليد مشاهد الفيديو بالذكاء الاصطناعي وتنسيق التعليق الصوتي والترجمة",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
