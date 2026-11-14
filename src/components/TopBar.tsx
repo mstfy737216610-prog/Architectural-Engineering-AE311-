@@ -79,7 +79,7 @@ export const TopBar: React.FC<TopBarProps> = ({
       {/* Mobile navigation row */}
       <nav
         aria-label="التنقل على الجوال"
-        className="flex md:hidden items-center gap-4 overflow-x-auto border-t border-slate-100 px-4 py-2"
+        className="flex md:hidden flex-wrap items-center justify-between gap-1 border-t border-slate-100 px-3 py-2"
       >
         {NAV_ITEMS.map((item) => {
           const isActive = activeTab === item.id;

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Archive,
   Download,
   Film,
   Loader2,
@@ -10,52 +11,64 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
-import {
-  CAPCUT_SUBTITLES,
-  PROMO_SCENES,
-} from '../data/noesisProjectData';
-import { SCENE_VISUAL_ASSETS } from '../data/sceneAssets';
+import type { ProjectDefinition } from '../data/noesisProjectData';
+import { PROJECT_SCENE_VISUAL_ASSETS } from '../data/sceneAssets';
 import {
   findActiveSceneAtTime,
-  findActiveSubtitleAtTime,
   formatFileSize,
   formatTimecode,
-  getDownloadHref,
-  type FullPromoMeta,
+  resolveClipForScene,
+  type AnimatedReelMeta,
   type GeneratedClipRecord,
 } from '../utils/promoStudio';
+import {
+  buildAndDownloadProjectZipInBrowser,
+  downloadRemoteFileViaBlob,
+} from '../utils/browserDownload';
 
 interface CinemaPlayerModalProps {
   isOpen: boolean;
   onClose: () => void;
-  generatedClips: Record<number, GeneratedClipRecord>;
+  project: ProjectDefinition;
+  projectClips: Record<string, GeneratedClipRecord>;
+  threeClips: Record<number, GeneratedClipRecord>;
   voiceoverAudioUrl: string | null;
-  fullPromo: FullPromoMeta | null;
-  isExportingFull: boolean;
-  onExportFull: () => Promise<void>;
+  animatedReel: AnimatedReelMeta | null;
+  isCompilingReel: boolean;
+  onCompileReel: () => Promise<void>;
   initialSceneId?: number;
   initialMode?: 'mp4' | 'storyboard';
 }
 
-const TOTAL_DURATION_SEC = 90;
-
 export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   isOpen,
   onClose,
-  generatedClips,
+  project,
+  projectClips,
+  threeClips,
   voiceoverAudioUrl,
-  fullPromo,
-  isExportingFull,
-  onExportFull,
+  animatedReel,
+  isCompilingReel,
+  onCompileReel,
   initialSceneId,
   initialMode,
 }) => {
+  const scenes = project.scenes;
+  const totalDurationSec = project.totalDurationSec;
+  const sceneAssets = PROJECT_SCENE_VISUAL_ASSETS[project.id];
+
   const [playbackMode, setPlaybackMode] = useState<'mp4' | 'storyboard'>('storyboard');
   const [isPlaying, setIsPlaying] = useState(true);
   const [currentTimeSec, setCurrentTimeSec] = useState(0);
-  const [isMuted, setIsMuted] = useState(false);
+  const [isMuted, setIsMuted] = useState(true);
+  const [isDownloadingZip, setIsDownloadingZip] = useState(false);
+  const [isDownloadingReel, setIsDownloadingReel] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  const generatedCount = scenes.filter((s) =>
+    Boolean(resolveClipForScene(s, projectClips, threeClips)),
+  ).length;
 
   useEffect(() => {
     if (!isOpen) {
@@ -66,36 +79,33 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       return;
     }
     const preferredMode =
-      initialMode ?? (fullPromo && !initialSceneId ? 'mp4' : 'storyboard');
-    setPlaybackMode(preferredMode === 'mp4' && !fullPromo ? 'storyboard' : preferredMode);
+      initialMode ?? (animatedReel && !initialSceneId ? 'mp4' : 'storyboard');
+    setPlaybackMode(preferredMode === 'mp4' && !animatedReel ? 'storyboard' : preferredMode);
 
     const startScene = initialSceneId
-      ? PROMO_SCENES.find((s) => s.id === initialSceneId)
-      : PROMO_SCENES[0];
+      ? scenes.find((s) => s.id === initialSceneId)
+      : scenes[0];
     setCurrentTimeSec(startScene ? startScene.startSec : 0);
     setIsPlaying(true);
-  }, [isOpen, initialSceneId, initialMode, fullPromo]);
+  }, [isOpen, initialSceneId, initialMode, animatedReel, scenes]);
 
-  const activeScene = findActiveSceneAtTime(PROMO_SCENES, currentTimeSec);
-  const activeSubtitle = findActiveSubtitleAtTime(CAPCUT_SUBTITLES, currentTimeSec);
-  const activeClip = generatedClips[activeScene.id];
+  const activeScene = findActiveSceneAtTime(scenes, currentTimeSec);
+  const activeClip = resolveClipForScene(activeScene, projectClips, threeClips);
 
-  // Advance master promo clock every 100ms while playing in storyboard mode
   useEffect(() => {
     if (!isOpen || !isPlaying || playbackMode !== 'storyboard') return;
     const interval = window.setInterval(() => {
       setCurrentTimeSec((prev) => {
-        if (prev + 0.1 >= TOTAL_DURATION_SEC) {
+        if (prev + 0.1 >= totalDurationSec) {
           setIsPlaying(false);
-          return TOTAL_DURATION_SEC;
+          return totalDurationSec;
         }
         return Number((prev + 0.1).toFixed(2));
       });
     }, 100);
     return () => window.clearInterval(interval);
-  }, [isOpen, isPlaying, playbackMode]);
+  }, [isOpen, isPlaying, playbackMode, totalDurationSec]);
 
-  // Sync generated WAV voiceover track in storyboard mode if available
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || !voiceoverAudioUrl || !isOpen || playbackMode !== 'storyboard') {
@@ -103,7 +113,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       return;
     }
     audio.muted = isMuted;
-    if (isPlaying) {
+    if (isPlaying && !isMuted) {
       if (Math.abs(audio.currentTime - currentTimeSec) > 0.8) {
         audio.currentTime = Math.min(currentTimeSec, audio.duration || currentTimeSec);
       }
@@ -113,7 +123,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     }
   }, [isPlaying, isMuted, voiceoverAudioUrl, isOpen, currentTimeSec, playbackMode]);
 
-  // Sync active MP4 clip playback if the active scene has a generated clip in storyboard mode
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid || !activeClip || !isOpen || playbackMode !== 'storyboard') return;
@@ -126,13 +135,13 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
   if (!isOpen) return null;
 
-  const progressPct = Math.min(100, (currentTimeSec / TOTAL_DURATION_SEC) * 100);
+  const progressPct = Math.min(100, (currentTimeSec / Math.max(1, totalDurationSec)) * 100);
 
   return (
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="عارض البرومو الكامل لمشروع NoesisAI"
+      aria-label={`عارض مشاهد ${project.shortNameAr}`}
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 p-4 md:p-8 backdrop-blur-sm"
     >
       <div className="flex w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900 text-white shadow-2xl">
@@ -142,14 +151,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             <span className="font-display text-sm font-bold text-white">NoesisAI</span>
             <span aria-hidden="true" className="text-slate-500">·</span>
             <span className="text-xs text-slate-300">
-              {playbackMode === 'mp4' && fullPromo
-                ? 'ملف البرومو الكامل الجاهز للتحميل (MP4 · 1:30)'
-                : `المشهد ${String(activeScene.id).padStart(2, '0')} من 12 — ${activeScene.titleAr}`}
+              {playbackMode === 'mp4' && animatedReel
+                ? `المقاطع المتحركة المجمّعة (${animatedReel.clipCount} مشاهد · 1080p · 30fps)`
+                : `${activeScene.code} من ${scenes.length} — ${activeScene.titleAr}`}
             </span>
           </div>
 
           <div className="flex items-center gap-2.5">
-            {fullPromo && (
+            {animatedReel && (
               <div
                 role="group"
                 aria-label="وضع العرض"
@@ -164,7 +173,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                       : 'text-slate-300 hover:text-white'
                   }`}
                 >
-                  ملف MP4 النهائي
+                  المقاطع المجمّعة
                 </button>
                 <button
                   type="button"
@@ -175,7 +184,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                       : 'text-slate-300 hover:text-white'
                   }`}
                 >
-                  المعاينة التفاعلية
+                  عرض لوحة المشاهد
                 </button>
               </div>
             )}
@@ -192,13 +201,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         </div>
 
         {/* 16:9 Stage */}
-        {playbackMode === 'mp4' && fullPromo ? (
+        {playbackMode === 'mp4' && animatedReel ? (
           <div className="relative aspect-video w-full overflow-hidden bg-black">
             <video
-              key={fullPromo.videoUrl}
-              src={fullPromo.videoUrl}
+              key={animatedReel.videoUrl}
+              src={animatedReel.videoUrl}
               controls
               autoPlay
+              muted
               playsInline
               className="h-full w-full object-contain bg-black"
             />
@@ -217,72 +227,56 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               />
             ) : (
               <img
-                key={activeScene.id}
-                src={SCENE_VISUAL_ASSETS[activeScene.id]}
+                key={`${project.id}-${activeScene.id}`}
+                src={sceneAssets[activeScene.id]}
                 alt={activeScene.titleAr}
                 referrerPolicy="no-referrer"
-                className={`h-full w-full object-cover ${isPlaying ? 'animate-ken-burns' : ''}`}
+                className="h-full w-full object-cover"
               />
             )}
 
-            {/* Scene 7 / Scene 10 subtle biometric scan overlay when previewing keyframe */}
-            {!activeClip && (activeScene.id === 7 || activeScene.id === 10) && isPlaying && (
-              <div
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-x-0 top-0 h-1/3 bg-gradient-to-b from-transparent via-emerald-400/20 to-transparent animate-scan-sweep"
-              />
-            )}
-
-            {/* Measured contrast scrim for subtitles */}
             <div
               aria-hidden="true"
-              className="pointer-events-none absolute inset-x-0 bottom-0 h-44 bg-gradient-to-t from-black/85 via-black/45 to-transparent"
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-32 bg-gradient-to-t from-black/85 via-black/40 to-transparent"
             />
 
-            {/* Top-left subtle scene timing badge */}
             <div
               dir="ltr"
-              className="absolute top-4 left-4 rounded-md bg-black/55 px-2.5 py-1 text-xs font-mono-tabular text-slate-200 backdrop-blur-xs"
+              className="absolute top-4 left-4 rounded-md bg-black/60 px-2.5 py-1 text-xs font-mono-tabular text-slate-200 backdrop-blur-xs"
             >
-              {activeScene.code} · {activeScene.timeRange}
-              {activeClip ? ' · Omni Flash MP4' : ' · Storyboard Animatic'}
+              {activeScene.code} · {activeScene.durationSec}s
+              {activeClip
+                ? ` · True 3D MP4 (${activeClip.resolution} · ${activeClip.fps || 30}fps)`
+                : ' · Clean 1080p Keyframe (Grok Ready)'}
             </div>
 
-            {/* English Subtitle & Arabic Voiceover Overlay */}
-            <div className="absolute inset-x-0 bottom-4 px-6 md:px-12 flex flex-col items-center gap-2 text-center">
+            <div className="absolute inset-x-0 bottom-4 px-6 md:px-12 flex flex-col items-center gap-1 text-center">
               <p className="max-w-3xl text-sm md:text-base font-medium text-emerald-200 leading-relaxed">
-                {activeScene.voiceoverSegmentAr}
+                {activeScene.titleAr}
               </p>
-              {activeSubtitle && (
-                <p
-                  dir="ltr"
-                  className="max-w-3xl rounded-md bg-black/60 px-3 py-1.5 text-xs md:text-sm font-display text-white/95 leading-snug"
-                >
-                  {activeSubtitle.textEn}
-                </p>
-              )}
+              <p className="max-w-2xl text-xs text-slate-300">
+                {activeScene.conceptAr}
+              </p>
             </div>
           </div>
         )}
 
-        {/* Hidden Voiceover Audio Element */}
         {voiceoverAudioUrl && <audio ref={audioRef} src={voiceoverAudioUrl} preload="auto" />}
 
         {/* Timeline & Download Footer */}
         <div className="flex flex-col gap-3 bg-slate-950 px-5 py-4">
           {playbackMode === 'storyboard' && (
             <>
-              {/* Interactive Scene Markers Strip */}
-              <div dir="ltr" className="flex items-center gap-1 overflow-x-auto pb-1">
-                {PROMO_SCENES.map((scene) => {
+              <div dir="ltr" className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                {scenes.map((scene) => {
                   const isCurrent = scene.id === activeScene.id;
-                  const hasMp4 = Boolean(generatedClips[scene.id]);
+                  const hasMp4 = Boolean(resolveClipForScene(scene, projectClips, threeClips));
                   return (
                     <button
                       key={scene.id}
                       type="button"
                       onClick={() => setCurrentTimeSec(scene.startSec)}
-                      className={`flex-1 min-w-[54px] rounded-md px-2 py-1.5 text-center transition-colors cursor-pointer ${
+                      className={`shrink-0 min-w-[60px] rounded-md px-2 py-1.5 text-center transition-colors cursor-pointer ${
                         isCurrent
                           ? 'bg-[#2E5332] text-white'
                           : hasMp4
@@ -291,14 +285,13 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                       }`}
                     >
                       <div className="text-[11px] font-mono-tabular font-semibold">
-                        {String(scene.id).padStart(2, '0')}
+                        {scene.code}
                       </div>
                     </button>
                   );
                 })}
               </div>
 
-              {/* Scrub Bar */}
               <div dir="ltr" className="flex items-center gap-3">
                 <span className="font-mono-tabular text-xs text-slate-300 w-10 text-right">
                   {formatTimecode(currentTimeSec)}
@@ -306,29 +299,30 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 <input
                   type="range"
                   min={0}
-                  max={TOTAL_DURATION_SEC}
+                  max={totalDurationSec}
                   step={0.5}
                   value={currentTimeSec}
-                  aria-label="شريط التقدم الزمني للفيديو"
+                  aria-label="شريط التقدم الزمني"
                   onChange={(e) => setCurrentTimeSec(Number(e.target.value))}
                   className="h-1.5 flex-1 cursor-pointer accent-[#4B8B52]"
                   style={{
                     background: `linear-gradient(to right, #4B8B52 ${progressPct}%, #334155 ${progressPct}%)`,
                   }}
                 />
-                <span className="font-mono-tabular text-xs text-slate-400 w-10">1:30</span>
+                <span className="font-mono-tabular text-xs text-slate-400 w-10">
+                  {formatTimecode(totalDurationSec)}
+                </span>
               </div>
             </>
           )}
 
-          {/* Transport & Direct MP4 Download Bar */}
           <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
             {playbackMode === 'storyboard' ? (
               <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => {
-                    if (currentTimeSec >= TOTAL_DURATION_SEC) {
+                    if (currentTimeSec >= totalDurationSec) {
                       setCurrentTimeSec(0);
                     }
                     setIsPlaying((p) => !p);
@@ -372,55 +366,96 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                     ) : (
                       <Volume2 className="h-4 w-4" aria-hidden="true" />
                     )}
-                    <span>{isMuted ? 'إلغاء الكتم' : 'الصوت نشط'}</span>
+                    <span>{isMuted ? 'صامت (الافتراضي)' : 'مع الصوت المرجعي'}</span>
                   </button>
                 )}
               </div>
             ) : (
               <div className="flex items-center gap-2 text-xs text-slate-300 tabular-nums">
-                <span>H.264 MP4</span>
+                <span>H.264 MP4 (Silent)</span>
                 <span aria-hidden="true">·</span>
                 <span dir="ltr" className="font-mono-tabular">
-                  {fullPromo?.aspectRatio || '16:9'}
+                  {animatedReel?.resolution || '1080p'} · {animatedReel?.fps || 30}fps
                 </span>
-                {fullPromo?.fileSizeBytes ? (
+                {animatedReel?.fileSizeBytes ? (
                   <>
                     <span aria-hidden="true">·</span>
                     <span dir="ltr" className="font-mono-tabular">
-                      {formatFileSize(fullPromo.fileSizeBytes)}
+                      {formatFileSize(animatedReel.fileSizeBytes)}
                     </span>
                   </>
                 ) : null}
-                <span aria-hidden="true">·</span>
-                <span>{fullPromo?.aiClipsUsed || 0}/12 AI</span>
               </div>
             )}
 
             <div className="flex items-center gap-2">
+              {generatedCount > 0 && (
+                <button
+                  type="button"
+                  disabled={isCompilingReel}
+                  onClick={onCompileReel}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 px-3 py-2 text-xs font-medium text-slate-200 hover:bg-white/10 disabled:opacity-50 transition-colors cursor-pointer"
+                >
+                  {isCompilingReel ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Film className="h-3.5 w-3.5" aria-hidden="true" />
+                  )}
+                  <span>{isCompilingReel ? 'جاري التجميع...' : 'تجميع المقاطع المتحركة'}</span>
+                </button>
+              )}
+
+              {animatedReel && (
+                <button
+                  type="button"
+                  disabled={isDownloadingReel}
+                  onClick={async () => {
+                    setIsDownloadingReel(true);
+                    try {
+                      await downloadRemoteFileViaBlob(
+                        animatedReel.videoUrl,
+                        'NoesisAI_Animated_Reel_1080p_30fps.mp4',
+                      );
+                    } finally {
+                      setIsDownloadingReel(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-white/20 px-3 py-2 text-xs font-semibold text-white hover:bg-white/10 disabled:opacity-50 transition-colors cursor-pointer"
+                >
+                  {isDownloadingReel ? (
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Download className="h-4 w-4" aria-hidden="true" />
+                  )}
+                  <span>تنزيل المجمّع MP4</span>
+                </button>
+              )}
+
               <button
                 type="button"
-                disabled={isExportingFull}
-                onClick={onExportFull}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 px-3 py-2 text-xs font-medium text-slate-200 hover:bg-white/10 disabled:opacity-50 transition-colors cursor-pointer"
+                disabled={isDownloadingZip}
+                onClick={async () => {
+                  setIsDownloadingZip(true);
+                  try {
+                    await buildAndDownloadProjectZipInBrowser({
+                      scope: project.id,
+                      projectClips,
+                      threeClips,
+                      includePngs: true,
+                    });
+                  } finally {
+                    setIsDownloadingZip(false);
+                  }
+                }}
+                className="inline-flex items-center gap-2 rounded-lg bg-[#2E5332] px-4 py-2 text-xs font-semibold text-white hover:bg-[#3A683F] disabled:opacity-50 transition-colors cursor-pointer"
               >
-                {isExportingFull ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                {isDownloadingZip ? (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
                 ) : (
-                  <Film className="h-3.5 w-3.5" aria-hidden="true" />
+                  <Archive className="h-4 w-4" aria-hidden="true" />
                 )}
-                <span>{isExportingFull ? 'جاري التصدير...' : 'إعادة تصدير MP4'}</span>
+                <span>{isDownloadingZip ? 'جاري التجهيز...' : 'تحميل الحزمة (ZIP)'}</span>
               </button>
-
-              {fullPromo && (
-                <a
-                  href={getDownloadHref(fullPromo.videoUrl)}
-                  download="NoesisAI-Promo-90s.mp4"
-                  className="inline-flex items-center gap-2 rounded-lg bg-[#2E5332] px-4 py-2 text-xs font-semibold text-white hover:bg-[#3A683F] transition-colors"
-                >
-                  <Download className="h-4 w-4" aria-hidden="true" />
-                  <span>تحميل الفيديو الكامل (MP4)</span>
-                </a>
-              )}
             </div>
           </div>
         </div>

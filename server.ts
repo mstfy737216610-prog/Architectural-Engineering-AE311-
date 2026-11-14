@@ -3,16 +3,36 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import { GoogleGenAI } from '@google/genai';
-import { CAPCUT_SUBTITLES, PROMO_SCENES } from './src/data/noesisProjectData.ts';
-import { generateCapCutSrt } from './src/utils/promoStudio.ts';
 import {
-  compileFullPromoMp4,
-  getSceneMotionPreset,
-  renderSingleSceneMp4,
-  type SceneRenderSpec,
+  CHARACTER_REFERENCE_ASSETS,
+  PROJECTS,
+  PROMO_SCENES,
+} from './src/data/noesisProjectData.ts';
+import {
+  buildDeliverablesZipBuffer,
+  concatenateAnimatedClipsMp4,
+  encodeJpegFramesToMp4,
+  normalizeGeneratedClipMp4,
+  type ZipClipEntry,
+  type ZipPngEntry,
 } from './server/videoCompiler.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+function resolveServerPort(): number {
+  const portFlagIdx = process.argv.indexOf('--port');
+  if (portFlagIdx !== -1 && process.argv[portFlagIdx + 1]) {
+    const cliPort = Number(process.argv[portFlagIdx + 1]);
+    if (Number.isFinite(cliPort) && cliPort > 0) return cliPort;
+  }
+  const envPort = process.env.PORT ? Number(process.env.PORT) : NaN;
+  const nginxPort = process.env.NGINX_PORT ? Number(process.env.NGINX_PORT) : NaN;
+  const defaultPort = Number(process.env.DEFAULT_APP_PORT || 3000);
+  if (Number.isFinite(envPort) && envPort > 0 && envPort !== nginxPort) {
+    return envPort;
+  }
+  return Number.isFinite(defaultPort) && defaultPort > 0 ? defaultPort : 3000;
+}
+
+const PORT = resolveServerPort();
 const WORKSPACE_ROOT = process.cwd();
 const GENERATED_DIR = path.join(WORKSPACE_ROOT, '.generated-videos');
 const MANIFEST_PATH = path.join(GENERATED_DIR, 'manifest.json');
@@ -22,33 +42,42 @@ fs.mkdirSync(GENERATED_DIR, { recursive: true });
 interface StoredClipMeta {
   sceneId: number;
   videoUrl: string;
-  downloadUrl?: string;
+  downloadUrl: string;
   interactionId: string;
-  source?: 'omni_flash' | 'local_ffmpeg';
+  source: 'omni_flash' | 'threejs_3d';
+  modelUsed: string;
   aspectRatio: '16:9' | '9:16';
   duration: string;
   resolution: string;
+  width: number;
+  height: number;
+  fps: number;
+  durationSec: number;
+  hasAudio: boolean;
+  fileSizeBytes: number;
+  lipSyncEnabled: boolean;
+  characterReferenceUsed: boolean;
   createdAt: string;
   promptUsed: string;
 }
 
-interface FullPromoMeta {
+interface AnimatedReelMeta {
   videoUrl: string;
   downloadUrl: string;
   aspectRatio: '16:9' | '9:16';
   resolution: '720p' | '1080p';
+  fps: number;
   durationSec: number;
   fileSizeBytes: number;
-  aiClipsUsed: number;
-  hasVoiceover: boolean;
-  hasSubtitles: boolean;
+  clipCount: number;
+  hasAudio: boolean;
   createdAt: string;
 }
 
 interface StoredManifest {
   clips: Record<string, StoredClipMeta>;
   voiceoverUrl?: string;
-  fullPromo?: FullPromoMeta;
+  animatedReel?: AnimatedReelMeta;
 }
 
 function readManifest(): StoredManifest {
@@ -61,7 +90,7 @@ function readManifest(): StoredManifest {
     return {
       clips: parsed.clips || {},
       voiceoverUrl: parsed.voiceoverUrl,
-      fullPromo: parsed.fullPromo,
+      animatedReel: parsed.animatedReel,
     };
   } catch {
     return { clips: {} };
@@ -72,14 +101,44 @@ function writeManifest(manifest: StoredManifest): void {
   fs.writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2), 'utf8');
 }
 
+// Clean up any legacy static-image Ken Burns promo files if present from earlier version
+function cleanupLegacyKenBurnsFiles(): void {
+  try {
+    const manifest = readManifest();
+    let changed = false;
+    for (const [k, clip] of Object.entries(manifest.clips)) {
+      if ((clip as { source?: string }).source === 'local_ffmpeg') {
+        delete manifest.clips[k];
+        changed = true;
+      }
+    }
+    if (changed) {
+      writeManifest(manifest);
+    }
+    for (const file of fs.readdirSync(GENERATED_DIR)) {
+      if (file.startsWith('noesisai-full-promo-') || file.includes('-local-')) {
+        fs.rmSync(path.join(GENERATED_DIR, file), { force: true });
+      }
+    }
+  } catch {
+    // Ignore cleanup errors
+  }
+}
+
+cleanupLegacyKenBurnsFiles();
+
 function getGenAIClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new Error(
-      'مفتاح GEMINI_API_KEY غير مُعدّ أو لا يزال بالقيمة الافتراضية. يرجى إعداد مفتاح API مدفوع في لوحة Settings > Secrets.',
+      'مفتاح GEMINI_API_KEY غير مُعدّ. يرجى اختيار مفتاح API مدفوع في Settings > Secrets لتشغيل التوليد الفعلي.',
     );
   }
-  return new GoogleGenAI({ apiKey });
+  return new GoogleGenAI({
+    apiKey,
+    apiVersion: 'v1beta',
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
 }
 
 function resolveSafeAssetPath(relativePath: string): string | null {
@@ -89,10 +148,7 @@ function resolveSafeAssetPath(relativePath: string): string | null {
     return null;
   }
   const resolved = path.resolve(WORKSPACE_ROOT, cleaned);
-  if (!resolved.startsWith(WORKSPACE_ROOT)) {
-    return null;
-  }
-  if (!fs.existsSync(resolved)) {
+  if (!resolved.startsWith(WORKSPACE_ROOT) || !fs.existsSync(resolved)) {
     return null;
   }
   return resolved;
@@ -117,7 +173,7 @@ function formatGeminiError(err: unknown): { status: number; message: string; cod
       status: 403,
       code: 'PAID_KEY_OR_PERMISSION_REQUIRED',
       message:
-        'فشل التحقق من صلاحيات مفتاح API أو أن النموذج يتطلب مفتاحاً مدفوعاً (Paid Tier). يرجى التحقق من GEMINI_API_KEY في Settings > Secrets.',
+        'فشل التحقق من صلاحيات مفتاح API أو أن نموذج gemini-omni-flash-preview يتطلب مفتاحاً مدفوعاً (Paid Tier). يرجى تفعيل مفتاح مدفوع في Settings > Secrets.',
     };
   }
 
@@ -126,7 +182,7 @@ function formatGeminiError(err: unknown): { status: number; message: string; cod
       status: 429,
       code: 'QUOTA_EXHAUSTED',
       message:
-        'تم تجاوز حصة الاستخدام أو أن نموذج gemini-omni-1.2-flash يتطلب مفتاح API مدفوعاً مفعّل الفوترة في Settings > Secrets.',
+        'تم تجاوز حصة الاستخدام أو أن مفتاح API الحالي مجاني بدون حصة فيديو (Quota = 0). لتوليد مقاطع الأنيميشن الحقيقية عبر gemini-omni-flash-preview يرجى تفعيل مفتاح API مدفوع الفوترة من Settings > Secrets.',
     };
   }
 
@@ -145,102 +201,12 @@ function formatGeminiError(err: unknown): { status: number; message: string; cod
   };
 }
 
-let fullExportInProgress: Promise<FullPromoMeta> | null = null;
-
-async function renderFullPromoVideo(options: {
-  aspectRatio: '16:9' | '9:16';
-  resolution?: '720p' | '1080p';
-  burnSubtitles: boolean;
-  includeVoiceover: boolean;
-}): Promise<FullPromoMeta> {
-  const { aspectRatio, resolution = '720p', burnSubtitles, includeVoiceover } = options;
-  const manifest = readManifest();
-  const workDir = path.join(GENERATED_DIR, `tmp-export-${Date.now()}`);
-  fs.mkdirSync(workDir, { recursive: true });
-
-  try {
-    let aiClipsUsed = 0;
-    const sceneSpecs: SceneRenderSpec[] = [];
-
-    for (const scene of PROMO_SCENES) {
-      const imagePath = resolveSafeAssetPath(scene.serverImagePath);
-      if (!imagePath) {
-        throw new Error(`Missing visual asset for scene ${scene.id}`);
-      }
-
-      const existingClip = manifest.clips[String(scene.id)];
-      const existingClipDiskPath = resolveGeneratedFile(existingClip?.videoUrl);
-      const canReuseClip =
-        Boolean(existingClipDiskPath) &&
-        (existingClip?.source === 'omni_flash' || existingClip?.aspectRatio === aspectRatio);
-
-      if (canReuseClip && existingClip?.source !== 'local_ffmpeg') {
-        aiClipsUsed += 1;
-      }
-
-      sceneSpecs.push({
-        id: scene.id,
-        durationSec: scene.durationSec,
-        imagePath,
-        omniVideoPath: canReuseClip ? existingClipDiskPath : null,
-        isUiScreen: scene.visualSource === 'figma_ui',
-        motionPreset: getSceneMotionPreset(scene.id),
-      });
-    }
-
-    let srtPath: string | null = null;
-    if (burnSubtitles) {
-      srtPath = path.join(workDir, 'subtitles.srt');
-      fs.writeFileSync(srtPath, generateCapCutSrt(CAPCUT_SUBTITLES), 'utf8');
-    }
-
-    const voiceoverDiskPath = includeVoiceover
-      ? resolveGeneratedFile(manifest.voiceoverUrl)
-      : null;
-
-    const finalFilename = `noesisai-full-promo-${aspectRatio.replace(':', 'x')}-${resolution}-${Date.now()}.mp4`;
-    const finalOutputPath = path.join(GENERATED_DIR, finalFilename);
-
-    const compiled = await compileFullPromoMp4({
-      scenes: sceneSpecs,
-      outputPath: finalOutputPath,
-      tempDir: path.join(workDir, 'segments'),
-      srtPath,
-      voiceoverWavPath: voiceoverDiskPath,
-      aspectRatio,
-      resolution,
-    });
-
-    const meta: FullPromoMeta = {
-      videoUrl: `/generated-videos/${finalFilename}`,
-      downloadUrl: `/api/videos/download/${encodeURIComponent(finalFilename)}`,
-      aspectRatio,
-      resolution,
-      durationSec: compiled.totalDurationSec,
-      fileSizeBytes: compiled.fileSizeBytes,
-      aiClipsUsed,
-      hasVoiceover: Boolean(voiceoverDiskPath),
-      hasSubtitles: burnSubtitles,
-      createdAt: new Date().toISOString(),
-    };
-
-    const latestManifest = readManifest();
-    latestManifest.fullPromo = meta;
-    writeManifest(latestManifest);
-
-    return meta;
-  } finally {
-    fs.rmSync(workDir, { recursive: true, force: true });
-  }
-}
-
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '15mb' }));
 
   app.use('/generated-videos', express.static(GENERATED_DIR));
 
-  // Direct attachment download endpoint for guaranteed file download in any browser/iframe
   app.get('/api/videos/download/:filename', (req, res) => {
     const safeName = path.basename(req.params.filename);
     const targetPath = path.join(GENERATED_DIR, safeName);
@@ -248,6 +214,7 @@ async function startServer() {
       res.status(404).json({ error: 'الملف المطلوب غير موجود.' });
       return;
     }
+    res.setHeader('Cache-Control', 'no-store');
     res.download(targetPath, safeName);
   });
 
@@ -255,14 +222,17 @@ async function startServer() {
     const hasKey = Boolean(
       process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY',
     );
-    res.json({ ok: true, hasApiKey: hasKey });
+    res.json({ ok: true, hasApiKey: hasKey, model: 'gemini-omni-flash-preview' });
   });
 
   app.get('/api/videos/list', (_req, res) => {
     const manifest = readManifest();
     const validClips: Record<string, StoredClipMeta> = {};
     for (const [key, clip] of Object.entries(manifest.clips)) {
-      if (resolveGeneratedFile(clip.videoUrl)) {
+      if (
+        (clip.source === 'omni_flash' || clip.source === 'threejs_3d') &&
+        resolveGeneratedFile(clip.videoUrl)
+      ) {
         validClips[key] = {
           ...clip,
           downloadUrl:
@@ -274,154 +244,158 @@ async function startServer() {
     const voiceoverUrl = resolveGeneratedFile(manifest.voiceoverUrl)
       ? manifest.voiceoverUrl
       : undefined;
-    const fullPromo =
-      manifest.fullPromo && resolveGeneratedFile(manifest.fullPromo.videoUrl)
-        ? {
-            ...manifest.fullPromo,
-            downloadUrl:
-              manifest.fullPromo.downloadUrl ||
-              `/api/videos/download/${encodeURIComponent(path.basename(manifest.fullPromo.videoUrl))}`,
-          }
+    const animatedReel =
+      manifest.animatedReel && resolveGeneratedFile(manifest.animatedReel.videoUrl)
+        ? manifest.animatedReel
         : undefined;
 
     res.json({
       clips: validClips,
       voiceoverUrl,
-      fullPromo,
-      isCompilingFull: Boolean(fullExportInProgress),
+      animatedReel,
     });
   });
 
-  app.post('/api/videos/export-full', async (req, res) => {
+  // Download All (ZIP): bundles all generated 1080p 30fps MP4 scenes + high-res 1080p reference PNGs
+  app.get('/api/videos/download-all-zip', async (req, res) => {
     try {
-      const {
-        aspectRatio = '16:9',
-        resolution = '720p',
-        burnSubtitles = true,
-        includeVoiceover = true,
-      } = (req.body || {}) as {
-        aspectRatio?: '16:9' | '9:16';
-        resolution?: '720p' | '1080p';
-        burnSubtitles?: boolean;
-        includeVoiceover?: boolean;
-      };
+      const includePngs = req.query.includePngs !== '0';
+      const manifest = readManifest();
 
-      if (aspectRatio !== '16:9' && aspectRatio !== '9:16') {
-        res.status(400).json({ error: 'الأبعاد يجب أن تكون 16:9 أو 9:16.' });
+      const zipClips: ZipClipEntry[] = [];
+      const zipPngs: ZipPngEntry[] = [];
+
+      for (const scene of PROMO_SCENES) {
+        const clip = manifest.clips[String(scene.id)];
+        const clipDiskPath = resolveGeneratedFile(clip?.videoUrl);
+        if (
+          clip &&
+          (clip.source === 'omni_flash' || clip.source === 'threejs_3d') &&
+          clipDiskPath
+        ) {
+          zipClips.push({
+            sceneId: scene.id,
+            filename: `NoesisAI_Scene_${String(scene.id).padStart(2, '0')}_1080p_30fps_silent.mp4`,
+            diskPath: clipDiskPath,
+          });
+        }
+
+        if (includePngs) {
+          const imgPath = resolveSafeAssetPath(scene.serverImagePath);
+          if (imgPath) {
+            zipPngs.push({
+              sceneId: scene.id,
+              filename: `NoesisAI_Scene_${String(scene.id).padStart(2, '0')}_1080p_reference.png`,
+              sourceImagePath: imgPath,
+            });
+          }
+        }
+      }
+
+      if (zipClips.length === 0 && zipPngs.length === 0) {
+        res.status(404).json({ error: 'لا توجد ملفات متاحة للتنزيل داخل الحزمة.' });
         return;
       }
 
-      if (resolution !== '720p' && resolution !== '1080p') {
-        res.status(400).json({ error: 'الدقة يجب أن تكون 720p أو 1080p.' });
-        return;
-      }
+      const zipBuffer = await buildDeliverablesZipBuffer({
+        clips: zipClips,
+        pngAssets: zipPngs,
+      });
 
-      if (!fullExportInProgress) {
-        fullExportInProgress = renderFullPromoVideo({
-          aspectRatio,
-          resolution,
-          burnSubtitles,
-          includeVoiceover,
-        }).finally(() => {
-          fullExportInProgress = null;
-        });
-      }
+      const zipName =
+        zipClips.length > 0
+          ? 'NoesisAI_Animated_Scenes_1080p_30fps.zip'
+          : 'NoesisAI_Reference_Keyframes_1080p_PNG.zip';
 
-      const result = await fullExportInProgress;
-      res.json(result);
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+      res.setHeader('Content-Length', String(zipBuffer.length));
+      res.send(zipBuffer);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'تعذر تصدير الفيديو الكامل.';
+      const msg = err instanceof Error ? err.message : 'تعذر إنشاء ملف ZIP المجمّع.';
       res.status(500).json({ error: msg });
     }
   });
 
-  app.post('/api/videos/render-local', async (req, res) => {
+  // Concatenate ONLY real AI-generated animated clips (never static images)
+  app.post('/api/videos/compile-animated-reel', async (req, res) => {
+    const workDir = path.join(GENERATED_DIR, `tmp-reel-${Date.now()}`);
     try {
-      const {
-        sceneId,
-        aspectRatio = '16:9',
-        resolution = '720p',
-        durationSec,
-      } = (req.body || {}) as {
-        sceneId?: number;
+      const { aspectRatio = '16:9', resolution = '1080p' } = (req.body || {}) as {
         aspectRatio?: '16:9' | '9:16';
         resolution?: '720p' | '1080p';
-        durationSec?: number;
-      };
-
-      const scene = PROMO_SCENES.find((s) => s.id === Number(sceneId));
-      if (!scene) {
-        res.status(400).json({ error: 'المشهد المحدد غير موجود.' });
-        return;
-      }
-      if (aspectRatio !== '16:9' && aspectRatio !== '9:16') {
-        res.status(400).json({ error: 'نسبة العرض إلى الارتفاع يجب أن تكون 16:9 أو 9:16.' });
-        return;
-      }
-
-      const safeResolution: '720p' | '1080p' = resolution === '1080p' ? '1080p' : '720p';
-      const imagePath = resolveSafeAssetPath(scene.serverImagePath);
-      if (!imagePath) {
-        res.status(404).json({ error: 'تعذر العثور على الإطار البصري للمشهد.' });
-        return;
-      }
-
-      const renderDuration =
-        typeof durationSec === 'number' && durationSec >= 3 && durationSec <= 20
-          ? durationSec
-          : scene.durationSec;
-
-      const filename = `noesis-scene-${String(scene.id).padStart(2, '0')}-local-${aspectRatio.replace(':', 'x')}-${Date.now()}.mp4`;
-      const outputPath = path.join(GENERATED_DIR, filename);
-
-      await renderSingleSceneMp4(
-        {
-          id: scene.id,
-          durationSec: renderDuration,
-          imagePath,
-          isUiScreen: scene.visualSource === 'figma_ui',
-          motionPreset: getSceneMotionPreset(scene.id),
-        },
-        outputPath,
-        aspectRatio,
-        safeResolution,
-        true,
-      );
-
-      const record: StoredClipMeta = {
-        sceneId: scene.id,
-        videoUrl: `/generated-videos/${filename}`,
-        downloadUrl: `/api/videos/download/${encodeURIComponent(filename)}`,
-        interactionId: `local-ffmpeg-${Date.now()}`,
-        source: 'local_ffmpeg',
-        aspectRatio,
-        duration: `${renderDuration}s`,
-        resolution: safeResolution,
-        createdAt: new Date().toISOString(),
-        promptUsed: `${getSceneMotionPreset(scene.id)} (${aspectRatio})`,
       };
 
       const manifest = readManifest();
-      manifest.clips[String(scene.id)] = record;
-      writeManifest(manifest);
+      const clipPaths: string[] = [];
+      for (const scene of PROMO_SCENES) {
+        const clip = manifest.clips[String(scene.id)];
+        const diskPath = resolveGeneratedFile(clip?.videoUrl);
+        if (clip && (clip.source === 'omni_flash' || clip.source === 'threejs_3d') && diskPath) {
+          clipPaths.push(diskPath);
+        }
+      }
 
-      res.json(record);
+      if (clipPaths.length === 0) {
+        res.status(400).json({
+          error:
+            'لم يتم توليد أي مقاطع أنيميشن حقيقية بعد. قم بتوليد المشاهد عبر Gemini Omni Flash أولاً (لا يُسمح بتجميع صور ثابتة).',
+        });
+        return;
+      }
+
+      const reelFilename = `noesisai-animated-reel-${aspectRatio.replace(':', 'x')}-${resolution}-${Date.now()}.mp4`;
+      const reelOutputPath = path.join(GENERATED_DIR, reelFilename);
+
+      const probe = await concatenateAnimatedClipsMp4({
+        clipPaths,
+        outputPath: reelOutputPath,
+        tempDir: workDir,
+        aspectRatio,
+        resolution,
+        targetFps: 30,
+      });
+
+      const meta: AnimatedReelMeta = {
+        videoUrl: `/generated-videos/${reelFilename}`,
+        downloadUrl: `/api/videos/download/${encodeURIComponent(reelFilename)}`,
+        aspectRatio,
+        resolution,
+        fps: probe.fps || 30,
+        durationSec: probe.durationSec,
+        fileSizeBytes: probe.fileSizeBytes,
+        clipCount: clipPaths.length,
+        hasAudio: false,
+        createdAt: new Date().toISOString(),
+      };
+
+      const latest = readManifest();
+      latest.animatedReel = meta;
+      writeManifest(latest);
+
+      res.json(meta);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'تعذر تصدير مقطع المشهد محلياً.';
+      const msg = err instanceof Error ? err.message : 'تعذر دمج مقاطع الأنيميشن.';
       res.status(500).json({ error: msg });
+    } finally {
+      fs.rmSync(workDir, { recursive: true, force: true });
     }
   });
 
   app.post('/api/videos/generate', async (req, res) => {
+    let rawTempPath: string | null = null;
     try {
       const {
         sceneId,
         prompt,
         aspectRatio = '16:9',
         duration = '8s',
-        resolution = '720p',
+        resolution = '1080p',
         referenceImagePath,
-        useReferenceImage = false,
+        useReferenceImage = true,
+        useCharacterReference = true,
+        lipSyncEnabled = false,
         previousInteractionId,
       } = req.body as {
         sceneId?: number;
@@ -431,6 +405,8 @@ async function startServer() {
         resolution?: '360p' | '720p' | '1080p';
         referenceImagePath?: string;
         useReferenceImage?: boolean;
+        useCharacterReference?: boolean;
+        lipSyncEnabled?: boolean;
         previousInteractionId?: string;
       };
 
@@ -446,39 +422,91 @@ async function startServer() {
 
       const ai = getGenAIClient();
       const trimmedPrompt = prompt.trim();
+      const reqProjectId =
+        (req.body as { projectId?: 'project1' | 'project2' }).projectId ?? 'project1';
+      const sceneObj =
+        PROJECTS[reqProjectId]?.scenes.find((s) => s.id === Number(sceneId)) ??
+        PROMO_SCENES.find((s) => s.id === Number(sceneId));
 
-      let inputPayload:
-        | string
-        | Array<
-            | { type: 'image'; mime_type: string; data: string }
-            | { type: 'text'; text: string }
-          > = trimmedPrompt;
+      type InputPart =
+        | { type: 'image'; mime_type: string; data: string }
+        | { type: 'text'; text: string };
 
-      if (useReferenceImage && referenceImagePath && !previousInteractionId) {
-        const safePath = resolveSafeAssetPath(referenceImagePath);
-        if (!safePath) {
-          res.status(400).json({ error: 'تعذر العثور على الصورة المرجعية المحددة للمشهد.' });
-          return;
-        }
-        const imageBytes = fs.readFileSync(safePath);
-        const ext = path.extname(safePath).toLowerCase();
-        const mimeType = ext === '.png' ? 'image/png' : 'image/jpeg';
-        inputPayload = [
-          {
+      let inputPayload: string | InputPart[] = trimmedPrompt;
+      let attachedCharRef = false;
+
+      if (!previousInteractionId && (useReferenceImage || useCharacterReference)) {
+        const parts: InputPart[] = [];
+        const addedDiskPaths = new Set<string>();
+        const refNotes: string[] = [];
+
+        if (useReferenceImage && referenceImagePath) {
+          const safePath = resolveSafeAssetPath(referenceImagePath);
+          if (!safePath) {
+            res.status(400).json({ error: 'تعذر العثور على الصورة المرجعية المحددة للمشهد.' });
+            return;
+          }
+          const imageBytes = fs.readFileSync(safePath);
+          const ext = path.extname(safePath).toLowerCase();
+          const mimeType = ext === '.png' ? 'image/png' : 'image/jpeg';
+          parts.push({
             type: 'image',
             mime_type: mimeType,
             data: imageBytes.toString('base64'),
-          },
-          {
-            type: 'text',
-            text: trimmedPrompt,
-          },
-        ];
+          });
+          addedDiskPaths.add(safePath);
+          refNotes.push('Image 1 is the starting scene frame and environment composition.');
+        }
+
+        if (
+          useCharacterReference &&
+          sceneObj &&
+          (sceneObj.characterAnchor === 'clinic_doctor' ||
+            sceneObj.characterAnchor === 'clinic_patient')
+        ) {
+          const charPaths = CHARACTER_REFERENCE_ASSETS[sceneObj.characterAnchor] || [];
+          for (const charRel of charPaths) {
+            const safeCharPath = resolveSafeAssetPath(charRel);
+            if (safeCharPath && !addedDiskPaths.has(safeCharPath)) {
+              const charBytes = fs.readFileSync(safeCharPath);
+              const ext = path.extname(safeCharPath).toLowerCase();
+              const mimeType = ext === '.png' ? 'image/png' : 'image/jpeg';
+              parts.push({
+                type: 'image',
+                mime_type: mimeType,
+                data: charBytes.toString('base64'),
+              });
+              addedDiskPaths.add(safeCharPath);
+              attachedCharRef = true;
+              refNotes.push(
+                `Image ${parts.length} is the Character Identity Reference — lock the exact same face, eyes, hair/hijab, glasses, beard, and attire across the entire animation.`,
+              );
+            }
+          }
+        } else if (
+          useCharacterReference &&
+          sceneObj &&
+          (sceneObj.characterAnchor === 'clinic_doctor' ||
+            sceneObj.characterAnchor === 'clinic_patient') &&
+          addedDiskPaths.size > 0
+        ) {
+          attachedCharRef = true;
+        }
+
+        if (parts.length > 0) {
+          const combinedPrompt =
+            refNotes.length > 0 ? `${refNotes.join(' ')} ${trimmedPrompt}` : trimmedPrompt;
+          parts.push({ type: 'text', text: combinedPrompt });
+          inputPayload = parts;
+        }
       }
+
+      const targetResolution: '720p' | '1080p' =
+        resolution === '720p' ? '720p' : '1080p';
 
       const interaction = await ai.interactions.create(
         {
-          model: 'gemini-omni-1.2-flash',
+          model: 'gemini-omni-flash-preview',
           ...(previousInteractionId ? { previous_interaction_id: previousInteractionId } : {}),
           input: inputPayload,
           background: false,
@@ -488,7 +516,7 @@ async function startServer() {
             type: 'video',
             aspect_ratio: aspectRatio,
             duration,
-            resolution,
+            resolution: targetResolution,
           },
         },
         { timeout: 300000 },
@@ -497,7 +525,8 @@ async function startServer() {
       const videoPart = interaction.output_video;
       if (!videoPart || (!videoPart.data && !videoPart.uri)) {
         res.status(502).json({
-          error: 'لم يُرجع نموذج gemini-omni-1.2-flash بيانات فيديو صالحة. حاول تعديل الوصف والمحاولة مجدداً.',
+          error:
+            'لم يُرجع نموذج gemini-omni-flash-preview بيانات فيديو صالحة. يرجى تعديل الوصف والمحاولة مجدداً.',
         });
         return;
       }
@@ -516,9 +545,23 @@ async function startServer() {
       }
 
       const safeSceneId = typeof sceneId === 'number' ? sceneId : 0;
-      const filename = `noesis-scene-${safeSceneId}-${Date.now()}.mp4`;
+      const timestamp = Date.now();
+      rawTempPath = path.join(GENERATED_DIR, `raw-scene-${safeSceneId}-${timestamp}.mp4`);
+      fs.writeFileSync(rawTempPath, videoBuffer);
+
+      const filename = `NoesisAI_Scene_${String(safeSceneId).padStart(2, '0')}_${targetResolution}_30fps_${timestamp}.mp4`;
       const outputPath = path.join(GENERATED_DIR, filename);
-      fs.writeFileSync(outputPath, videoBuffer);
+
+      const parsedDuration = Math.min(15, Math.max(3, Number.parseInt(duration, 10) || 8));
+      const probe = await normalizeGeneratedClipMp4({
+        inputPath: rawTempPath,
+        outputPath,
+        aspectRatio,
+        resolution: targetResolution,
+        targetFps: 30,
+        durationSec: parsedDuration,
+        stripAudio: true,
+      });
 
       const videoUrl = `/generated-videos/${filename}`;
       const record: StoredClipMeta = {
@@ -527,9 +570,18 @@ async function startServer() {
         downloadUrl: `/api/videos/download/${encodeURIComponent(filename)}`,
         interactionId: interaction.id,
         source: 'omni_flash',
+        modelUsed: 'gemini-omni-flash-preview',
         aspectRatio,
-        duration,
-        resolution,
+        duration: `${parsedDuration}s`,
+        resolution: targetResolution,
+        width: probe.width,
+        height: probe.height,
+        fps: probe.fps,
+        durationSec: probe.durationSec,
+        hasAudio: probe.hasAudio,
+        fileSizeBytes: probe.fileSizeBytes,
+        lipSyncEnabled: Boolean(lipSyncEnabled),
+        characterReferenceUsed: attachedCharRef || Boolean(useCharacterReference),
         createdAt: new Date().toISOString(),
         promptUsed: trimmedPrompt,
       };
@@ -547,6 +599,114 @@ async function startServer() {
         error: formatted.message,
         code: formatted.code,
       });
+    } finally {
+      if (rawTempPath && fs.existsSync(rawTempPath)) {
+        fs.rmSync(rawTempPath, { force: true });
+      }
+    }
+  });
+
+  // Free Local 3D Frame-to-MP4 Pipeline (Three.js PBR WebGL scenes SC-03, SC-04, SC-05)
+  const threeSessions = new Map<string, { dir: string; sceneId: number }>();
+
+  app.post('/api/videos/threejs/start', (req, res) => {
+    const { sceneId } = (req.body || {}) as { sceneId?: number };
+    if (sceneId !== 3 && sceneId !== 4 && sceneId !== 5) {
+      res.status(400).json({ error: 'التصيير المحلي بـ Three.js متاح لمشاهد العناصر والهاردوير (3 و 4 و 5) فقط.' });
+      return;
+    }
+    const sessionId = `3d-${sceneId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionDir = path.join(GENERATED_DIR, `tmp-${sessionId}`);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    threeSessions.set(sessionId, { dir: sessionDir, sceneId });
+    res.json({ sessionId });
+  });
+
+  app.post('/api/videos/threejs/chunk', (req, res) => {
+    const { sessionId, frames } = (req.body || {}) as {
+      sessionId?: string;
+      frames?: Array<{ index: number; jpegBase64: string }>;
+    };
+    const session = sessionId ? threeSessions.get(sessionId) : undefined;
+    if (!session || !Array.isArray(frames)) {
+      res.status(400).json({ error: 'جلسة التصيير الثلاثي الأبعاد غير صالحة.' });
+      return;
+    }
+    for (const f of frames) {
+      const idx = Number(f.index);
+      if (!Number.isInteger(idx) || idx < 0 || idx > 600) continue;
+      const cleanB64 = f.jpegBase64.replace(/^data:image\/\w+;base64,/, '');
+      const framePath = path.join(session.dir, `frame_${String(idx).padStart(4, '0')}.jpg`);
+      fs.writeFileSync(framePath, Buffer.from(cleanB64, 'base64'));
+    }
+    res.json({ ok: true, received: frames.length });
+  });
+
+  app.post('/api/videos/threejs/finish', async (req, res) => {
+    const {
+      sessionId,
+      aspectRatio = '16:9',
+      resolution = '1080p',
+      durationSec = 8,
+    } = (req.body || {}) as {
+      sessionId?: string;
+      aspectRatio?: '16:9' | '9:16';
+      resolution?: '720p' | '1080p';
+      durationSec?: number;
+    };
+    const session = sessionId ? threeSessions.get(sessionId) : undefined;
+    if (!session) {
+      res.status(400).json({ error: 'جلسة التصيير الثلاثي الأبعاد منتهية أو غير موجودة.' });
+      return;
+    }
+    threeSessions.delete(sessionId!);
+    try {
+      const timestamp = Date.now();
+      const filename = `NoesisAI_Scene_${String(session.sceneId).padStart(2, '0')}_3D_${resolution}_30fps_${timestamp}.mp4`;
+      const outputPath = path.join(GENERATED_DIR, filename);
+
+      const probe = await encodeJpegFramesToMp4({
+        framesDir: session.dir,
+        outputPath,
+        aspectRatio,
+        resolution,
+        fps: 30,
+        durationSec,
+      });
+
+      const sceneMeta = PROMO_SCENES.find((s) => s.id === session.sceneId);
+      const record: StoredClipMeta = {
+        sceneId: session.sceneId,
+        videoUrl: `/generated-videos/${filename}`,
+        downloadUrl: `/api/videos/download/${encodeURIComponent(filename)}`,
+        interactionId: `threejs-3d-${timestamp}`,
+        source: 'threejs_3d',
+        modelUsed: 'threejs-webgl-pbr-3d',
+        aspectRatio,
+        duration: `${durationSec}s`,
+        resolution,
+        width: probe.width,
+        height: probe.height,
+        fps: probe.fps,
+        durationSec: probe.durationSec,
+        hasAudio: probe.hasAudio,
+        fileSizeBytes: probe.fileSizeBytes,
+        lipSyncEnabled: false,
+        characterReferenceUsed: false,
+        createdAt: new Date().toISOString(),
+        promptUsed: sceneMeta?.motionPrompt || 'Procedural 3D WebGL PBR Scene',
+      };
+
+      const manifest = readManifest();
+      manifest.clips[String(session.sceneId)] = record;
+      writeManifest(manifest);
+
+      res.json(record);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'تعذر ترميز إطارات 3D إلى MP4.';
+      res.status(500).json({ error: msg });
+    } finally {
+      fs.rmSync(session.dir, { recursive: true, force: true });
     }
   });
 
@@ -616,12 +776,20 @@ async function startServer() {
   });
 
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    const vitePromise = import('vite').then(({ createServer: createViteServer }) =>
+      createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      }),
+    );
+    app.use(async (req, res, next) => {
+      try {
+        const vite = await vitePromise;
+        vite.middlewares(req, res, next);
+      } catch (err) {
+        next(err);
+      }
     });
-    app.use(vite.middlewares);
   } else {
     const distDir = path.join(WORKSPACE_ROOT, 'dist');
     app.use(express.static(distDir));
@@ -631,30 +799,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`NoesisAI Promo Video Studio server running at http://localhost:${PORT}`);
-    // Pre-build the downloadable 90s MP4 on boot if not yet rendered so user always has a real downloadable MP4 immediately
-    const manifest = readManifest();
-    if (!manifest.fullPromo || !resolveGeneratedFile(manifest.fullPromo.videoUrl)) {
-      if (!fullExportInProgress) {
-        fullExportInProgress = renderFullPromoVideo({
-          aspectRatio: '16:9',
-          resolution: '720p',
-          burnSubtitles: true,
-          includeVoiceover: true,
-        })
-          .then((meta) => {
-            console.log(`Pre-rendered 90s full promo MP4 ready: ${meta.videoUrl}`);
-            return meta;
-          })
-          .catch((err) => {
-            console.error('Background pre-render error:', err);
-            throw err;
-          })
-          .finally(() => {
-            fullExportInProgress = null;
-          });
-      }
-    }
+    console.log(`NoesisAI True Animation Studio running at http://localhost:${PORT}`);
   });
 }
 

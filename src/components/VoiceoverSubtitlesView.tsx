@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -7,29 +7,38 @@ import {
   Loader2,
   Mic,
 } from 'lucide-react';
+import type { ProjectDefinition } from '../data/noesisProjectData';
 import {
-  CAPCUT_SUBTITLES,
-  FULL_VOICEOVER_SCRIPT_AR,
-  PROMO_SCENES,
-} from '../data/noesisProjectData';
-import { generateCapCutSrt } from '../utils/promoStudio';
+  buildProjectVoiceoverTxt,
+  generateCapCutSrt,
+} from '../utils/promoStudio';
+import {
+  downloadRemoteFileViaBlob,
+  triggerBlobDownload,
+} from '../utils/browserDownload';
 
 interface VoiceoverSubtitlesViewProps {
+  project: ProjectDefinition;
   voiceoverAudioUrl: string | null;
   onVoiceoverGenerated: (url: string) => void;
 }
 
 export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
+  project,
   voiceoverAudioUrl,
   onVoiceoverGenerated,
 }) => {
-  const [scriptText, setScriptText] = useState(FULL_VOICEOVER_SCRIPT_AR);
+  const [scriptText, setScriptText] = useState(project.voiceoverScriptAr);
   const [copiedScript, setCopiedScript] = useState(false);
   const [copiedSrt, setCopiedSrt] = useState(false);
   const [isGeneratingAudio, setIsGeneratingAudio] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
 
-  const srtContent = generateCapCutSrt(CAPCUT_SUBTITLES);
+  useEffect(() => {
+    setScriptText(project.voiceoverScriptAr);
+  }, [project]);
+
+  const srtContent = generateCapCutSrt(project.subtitlesEn);
 
   const handleCopyScript = async () => {
     try {
@@ -39,6 +48,15 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
     } catch {
       // Ignore clipboard failures
     }
+  };
+
+  const handleDownloadVoiceoverTxt = () => {
+    const content = buildProjectVoiceoverTxt({
+      ...project,
+      voiceoverScriptAr: scriptText,
+    });
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    triggerBlobDownload(blob, `NoesisAI_${project.id}_Arabic_Voiceover.txt`);
   };
 
   const handleCopySrt = async () => {
@@ -53,14 +71,7 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
 
   const handleDownloadSrt = () => {
     const blob = new Blob([srtContent], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'noesisai-promo-subtitles.srt';
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    triggerBlobDownload(blob, `NoesisAI_${project.id}_CapCut_EN.srt`);
   };
 
   const handleGenerateVoiceoverAudio = async () => {
@@ -88,10 +99,10 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
     <div className="flex flex-col gap-8">
       <div>
         <h1 className="text-2xl font-bold text-slate-900">
-          النص العربي للتعليق الصوتي وترجمة CapCut الإنجليزية
+          التعليق الصوتي والترجمة — {project.shortNameAr}
         </h1>
         <p className="mt-1.5 max-w-3xl text-sm text-slate-600 leading-relaxed">
-          توليد ملف التعليق الصوتي العربي بصيغة WAV وتصدير ملف الترجمة الإنجليزية (.srt) الجاهز للاستيراد المباشر داخل CapCut.
+          {project.subtitleAr}
         </p>
       </div>
 
@@ -101,27 +112,37 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
           aria-labelledby="voiceover-heading"
           className="rounded-xl border border-slate-200 bg-white p-5 flex flex-col gap-4"
         >
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 id="voiceover-heading" className="text-base font-bold text-slate-900">
-              النص العربي للتعليق الصوتي
+              النص العربي للتعليق الصوتي ({project.totalDurationSec}s)
             </h2>
-            <button
-              type="button"
-              onClick={handleCopyScript}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
-            >
-              {copiedScript ? (
-                <>
-                  <Check className="h-3.5 w-3.5 text-[#2E5332]" aria-hidden="true" />
-                  <span>تم النسخ</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>نسخ النص</span>
-                </>
-              )}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleCopyScript}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+              >
+                {copiedScript ? (
+                  <>
+                    <Check className="h-3.5 w-3.5 text-[#2E5332]" aria-hidden="true" />
+                    <span>تم النسخ</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>نسخ النص</span>
+                  </>
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadVoiceoverTxt}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+              >
+                <Download className="h-3.5 w-3.5 text-[#2E5332]" aria-hidden="true" />
+                <span>تصدير .TXT</span>
+              </button>
+            </div>
           </div>
 
           <label htmlFor="arabic-voiceover-editor" className="sr-only">
@@ -150,30 +171,32 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
               type="button"
               disabled={isGeneratingAudio || !scriptText.trim()}
               onClick={handleGenerateVoiceoverAudio}
-              className="inline-flex items-center gap-2 rounded-lg bg-[#2E5332] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#234126] disabled:opacity-60 cursor-pointer"
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-60 cursor-pointer"
             >
               {isGeneratingAudio ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  <span>جاري توليد الصوت العربي...</span>
+                  <span>جاري توليد الصوت...</span>
                 </>
               ) : (
                 <>
-                  <Mic className="h-4 w-4" aria-hidden="true" />
-                  <span>توليد التعليق الصوتي (Gemini TTS)</span>
+                  <Mic className="h-4 w-4 text-[#2E5332]" aria-hidden="true" />
+                  <span>توليد صوت اختياري (يتطلب مفتاح API)</span>
                 </>
               )}
             </button>
 
             {voiceoverAudioUrl && (
-              <a
-                href={voiceoverAudioUrl}
-                download="noesisai-arabic-voiceover.wav"
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2.5 text-xs font-semibold text-slate-800 hover:bg-slate-50"
+              <button
+                type="button"
+                onClick={() =>
+                  downloadRemoteFileViaBlob(voiceoverAudioUrl, 'noesisai-arabic-voiceover.wav')
+                }
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
               >
                 <Download className="h-4 w-4" aria-hidden="true" />
                 <span>تنزيل WAV</span>
-              </a>
+              </button>
             )}
           </div>
 
@@ -185,12 +208,14 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
 
           {/* Scene-by-scene voiceover alignment */}
           <div className="pt-3 border-t border-slate-100">
-            <h3 className="text-xs font-bold text-slate-700 mb-2">توزيع التعليق على المشاهد</h3>
-            <div className="flex flex-col divide-y divide-slate-100 max-h-64 overflow-y-auto">
-              {PROMO_SCENES.map((scene) => (
+            <h3 className="text-xs font-bold text-slate-700 mb-2">
+              توزيع التعليق على المشاهد ({project.scenes.length})
+            </h3>
+            <div className="flex flex-col divide-y divide-slate-100 max-h-72 overflow-y-auto">
+              {project.scenes.map((scene) => (
                 <div key={scene.id} className="py-2 flex items-start gap-3 text-xs">
                   <span dir="ltr" className="font-mono-tabular text-slate-500 shrink-0">
-                    {scene.timeRange}
+                    {scene.code} · {scene.timeRange}
                   </span>
                   <span className="text-slate-700 leading-relaxed">
                     {scene.voiceoverSegmentAr}
@@ -208,7 +233,7 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
         >
           <div className="flex flex-wrap items-center justify-between gap-3">
             <h2 id="subtitles-heading" className="text-base font-bold text-slate-900">
-              الترجمة الإنجليزية (CapCut Subtitles)
+              الترجمة الإنجليزية (CapCut Subtitles .SRT)
             </h2>
             <div className="flex items-center gap-2">
               <button
@@ -240,7 +265,7 @@ export const VoiceoverSubtitlesView: React.FC<VoiceoverSubtitlesViewProps> = ({
           </div>
 
           <div className="flex flex-col divide-y divide-slate-200 border border-slate-200 rounded-lg overflow-hidden">
-            {CAPCUT_SUBTITLES.map((cue) => (
+            {project.subtitlesEn.map((cue) => (
               <div key={cue.id} className="p-4 bg-white flex flex-col gap-1.5">
                 <div className="flex items-center justify-between text-xs text-slate-500">
                   <span dir="ltr" className="font-mono-tabular font-semibold text-[#2E5332]">

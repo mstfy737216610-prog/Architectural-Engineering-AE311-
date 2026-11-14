@@ -13,7 +13,10 @@ export const ResearchBenchmarksView: React.FC = () => {
           الأرقام الرسمية والمعايير الهندسية والطبية (NoesisAI)
         </h1>
         <p className="mt-1.5 max-w-3xl text-sm text-slate-600 leading-relaxed">
-          المرجع الموثق من مستند التقييم والتجارب العلمية لضمان دقة الأرقام المذكورة في التعليق الصوتي والترجمة والمشاهد.
+          المرجع الموثق من مستند التقييم والتجارب العلمية (الفصل الرابع والملخص التنفيذي) لضمان دقة الأرقام المذكورة في التعليق الصوتي والترجمة والمشاهد.
+        </p>
+        <p className="mt-2 max-w-3xl rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs text-slate-600 leading-relaxed">
+          ملاحظة التوثيق: الأرقام الرسمية المعتمدة في الإعلان هي نتائج التحقق النهائي في الفصل الرابع (ViT بنسبة <span dir="ltr" className="font-mono-tabular font-semibold text-slate-900">91.66%</span> وزمن <span dir="ltr" className="font-mono-tabular font-semibold text-slate-900">8.37 ms</span>، وVGG-Face بنسبة <span dir="ltr" className="font-mono-tabular font-semibold text-slate-900">89.09%</span>)، وليست أرقام المحاكاة الأولية في الفصل الثالث (<span dir="ltr" className="font-mono-tabular">91.72% / 87.18%</span>).
         </p>
       </div>
 
